@@ -1,6 +1,8 @@
-from typing import Optional
-import importlib
+from typing import Optional, Generator
+import os
 import re
+import pathlib
+import requests
 
 # ===== Safety & resources =====
 
@@ -28,7 +30,7 @@ CRISIS_PATTERNS = [
     r"\b(abuse|assault|raped?|molest(ed)?)\b",
     r"\b(immediate danger|can'?t keep myself safe)\b",
 ]
-_CRISIS_RE = [re.compile(pat, re.IGNORECASE) for pat in CRISIS_PATTERNS]
+_CRISIS_RE = [re.compile(p, re.IGNORECASE) for p in CRISIS_PATTERNS]
 
 def safety_check(text: str) -> str:
     t = text or ""
@@ -65,192 +67,171 @@ def helpline_reply() -> str:
         "If you’d like, I can also share some coping ideas while you reach out."
     )
 
-# ===== Lazy import torch so this module imports without it =====
-
-try:
-    torch = importlib.import_module("torch")
-    _HAS_TORCH = True
-except Exception:
-    torch = None
-    _HAS_TORCH = False
-
-def _select_device() -> str:
-    if not _HAS_TORCH:
-        return "cpu"
-    try:
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"  # Apple Silicon
-    except Exception:
-        pass
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
+# ====== GGUF (llama.cpp) Chatbot ======
 
 class Chatbot:
+    """
+    Fast CPU-friendly chatbot using a quantized TinyLlama GGUF model via llama-cpp-python,
+    with TinyLlama's chat formatting and safety routing.
+    """
+
     def __init__(
         self,
-        model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        device: Optional[str] = None,
-        tokenizer=None,
-        model=None,
-        autoload: bool = True,
+        model_path: Optional[str] = None,
+        model_url: Optional[str] = None,
+        n_ctx: int = int(os.getenv("N_CTX", "2048")),
+        n_threads: Optional[int] = None,
+        n_gpu_layers: int = 0,  # keep 0 for CPU-only hosts
         system_prompt: Optional[str] = None,
     ):
-        self.model_name = model_name
+        # Resolve model location (download if needed)
+        self.model_path = self._ensure_model(model_path, model_url)
         self.system_prompt = system_prompt or THERAPY_SYSTEM
         self.history_text: Optional[str] = None
 
-        if device is not None and _HAS_TORCH:
-            self.device = torch.device(device)
-        else:
-            self.device = _select_device()
+        if n_threads is None:
+            n_threads = max(1, (os.cpu_count() or 2) - 1)
 
-        if _HAS_TORCH:
-            dtype_label = getattr(self.device, "type", "cpu")
-            print(f"[Device] Using {'GPU' if dtype_label in ('cuda','mps') else 'CPU'}: {self.device}")
-        else:
-            print("[Device] PyTorch not installed; using CPU.")
+        from llama_cpp import Llama  # local import so the module can be imported without it
 
-        if tokenizer is not None and model is not None:
-            self.tokenizer = tokenizer
-            self.model = model
-        elif autoload:
-            try:
-                transformers = importlib.import_module("transformers")
-            except ModuleNotFoundError as e:
-                raise ModuleNotFoundError(
-                    "transformers is required when autoload=True. Install with: pip install transformers"
-                ) from e
+        print(f"[llama.cpp] Loading model: {self.model_path}")
+        self.llm = Llama(
+            model_path=self.model_path,
+            n_ctx=n_ctx,
+            n_threads=n_threads,
+            n_gpu_layers=n_gpu_layers,
+            verbose=False,
+        )
+        print(f"[llama.cpp] Ready (ctx={n_ctx}, threads={n_threads})")
 
-            AutoTokenizer = getattr(transformers, "AutoTokenizer")
-            AutoModelForCausalLM = getattr(transformers, "AutoModelForCausalLM")
+    # ---- conversation helpers ----
 
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-
-            # ---- IMPORTANT: avoid meta tensors on CPU; materialize real weights ----
-            model_kwargs = {}
-            if _HAS_TORCH:
-                dev_type = getattr(self.device, "type", str(self.device))
-                if dev_type == "cuda":
-                    model_kwargs["torch_dtype"] = getattr(torch, "float16", None)
-                    model_kwargs["low_cpu_mem_usage"] = False
-                    model_kwargs["device_map"] = None
-                else:  # CPU (or MPS -> load on CPU then .to(mps) if needed)
-                    model_kwargs["torch_dtype"] = torch.float32
-                    model_kwargs["low_cpu_mem_usage"] = False
-                    model_kwargs["device_map"] = None
-
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
-            if _HAS_TORCH:
-                self.model = self.model.to(self.device)
-            if hasattr(self.model, "config"):
-                self.model.config.use_cache = True
-            if hasattr(self.model, "eval"):
-                self.model.eval()
-        else:
-            self.tokenizer = None
-            self.model = None
-
-        # Ensure pad token exists (often EOS)
-        if self.tokenizer is not None and getattr(self.tokenizer, "pad_token_id", None) is None:
-            if getattr(self.tokenizer, "eos_token", None) is not None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # Cache TinyLlama's <|end|> id if present
-        self.end_token_id = None
-        if self.tokenizer is not None:
-            end_id = self.tokenizer.convert_tokens_to_ids("<|end|>")
-            if isinstance(end_id, int) and end_id != self.tokenizer.unk_token_id:
-                self.end_token_id = end_id
-
-    # --- utilities ---
     def reset_history(self):
         self.history_text = None
-
-    def set_system_prompt(self, system_prompt: str):
-        self.system_prompt = system_prompt
-        self.reset_history()
-
-    def encode_prompt(self, text: str):
-        if self.tokenizer is None:
-            raise RuntimeError("Tokenizer not loaded.")
-        if not _HAS_TORCH:
-            raise RuntimeError("PyTorch is required for return_tensors='pt'. Install with: pip install torch")
-        return self.tokenizer(text, return_tensors="pt").to(self.device)
-
-    def decode_reply(self, reply_ids: list[int]) -> str:
-        if self.tokenizer is None:
-            raise RuntimeError("Tokenizer not loaded.")
-        return self.tokenizer.decode(reply_ids, skip_special_tokens=True).strip()
 
     def _prompt_with_history(self, user_text: str) -> str:
         if self.history_text is None:
             self.history_text = self.system_prompt
         return f"{self.history_text}<|user|>\n{user_text}\n<|end|>\n<|assistant|>\n"
 
-    # --- chat generation with safety + token-accurate slicing ---
+    # ---- generation: non-streaming ----
+
     def generate_reply(
         self,
         user_text: str,
-        max_new_tokens: int = 80,   # lighter default for small plans
-        temperature: float = 0.8,
+        max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "48")),
+        temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 40,
-        do_sample: bool = True,
-        repetition_penalty: float = 1.05,
+        repeat_penalty: float = 1.0,
+        max_ctx_tokens: int = int(os.getenv("MAX_CTX_TOKENS", "384")),
     ) -> str:
-        # 1) Safety short-circuits
+        # Safety first
         if safety_check(user_text) == "crisis":
             return crisis_reply()
         if helpline_intent(user_text):
             return helpline_reply()
 
-        if self.model is None or self.tokenizer is None:
-            raise RuntimeError("Model/tokenizer not loaded.")
-        if not _HAS_TORCH:
-            raise RuntimeError("PyTorch is required to generate. Install with: pip install torch")
+        prompt_text = self._prompt_with_history(user_text)
+
+        # llama.cpp does context trimming internally if needed, but we'll keep prompts short anyway
+        # Generate (completion API works fine for TinyLlama chat format)
+        out = self.llm.create_completion(
+            prompt=prompt_text,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            stop=["<|end|>"],
+        )
+
+        text = out["choices"][0]["text"].strip()
+        # Update history (append assistant reply + end token)
+        self.history_text = f"{prompt_text}{text}\n<|end|>\n"
+        return text
+
+    # ---- generation: streaming ----
+
+    def stream_reply(
+        self,
+        user_text: str,
+        max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "48")),
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 40,
+        repeat_penalty: float = 1.0,
+    ) -> Generator[str, None, None]:
+        # Safety first (stream static messages immediately)
+        if safety_check(user_text) == "crisis":
+            yield crisis_reply()
+            return
+        if helpline_intent(user_text):
+            yield helpline_reply()
+            return
 
         prompt_text = self._prompt_with_history(user_text)
-        enc = self.encode_prompt(prompt_text)
 
-        eos_id = self.end_token_id or self.tokenizer.eos_token_id
-        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        stream = self.llm.create_completion(
+            prompt=prompt_text,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            stop=["<|end|>"],
+            stream=True,
+        )
 
-        with torch.no_grad():
-            out = self.model.generate(
-                input_ids=enc["input_ids"],
-                attention_mask=enc["attention_mask"],
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                pad_token_id=pad_id,
-                eos_token_id=eos_id,
-            )
+        partial = ""
+        for chunk in stream:
+            token = chunk["choices"][0]["text"]
+            partial += token
+            if token:
+                yield token
+        # Save history
+        self.history_text = f"{prompt_text}{partial}\n<|end|>\n"
 
-        # Slice by token IDs (not characters)
-        start = enc["input_ids"].shape[-1]
-        gen_ids = out[0, start:]
-        reply_text = self.decode_reply(gen_ids.tolist()).strip()
+    # ---- model download helper ----
 
-        # Update history for next turn
-        self.history_text = f"{prompt_text}{reply_text}\n<|end|>\n"
-        return reply_text
+    @staticmethod
+    def _ensure_model(model_path: Optional[str], model_url: Optional[str]) -> str:
+        """
+        Ensure a GGUF model is present locally. If not provided, default to a good TinyLlama chat quant.
 
-    # Optional one-shot generator (non-chat)
-    def generate(self, prompt: str, max_new_tokens: int = 64) -> str:
-        if self.model is None or self.tokenizer is None:
-            raise RuntimeError("Model/tokenizer not loaded.")
-        if not _HAS_TORCH:
-            raise RuntimeError("PyTorch is required to generate. Install with: pip install torch")
-        enc = self.encode_prompt(prompt)
-        with torch.no_grad():
-            out = self.model.generate(
-                **enc,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-                eos_token_id=self.end_token_id or self.tokenizer.eos_token_id,
-            )
-        ids = out[0, enc["input_ids"].shape[-1]:].tolist()
-        return self.decode_reply(ids)
+        Default URL: TinyLlama-1.1B-Chat-v1.0 Q4_K_M (by TheBloke)
+        """
+        # Prefer explicit path via env or arg
+        model_path = (
+            model_path
+            or os.getenv("MODEL_PATH")
+            or "/opt/models/tinyllama-1.1b-chat-q4_k_m.gguf"
+        )
+        model_file = pathlib.Path(model_path)
+
+        if model_file.exists():
+            return str(model_file)
+
+        # Where to download from (override via env MODEL_URL)
+        url = (
+            model_url
+            or os.getenv("MODEL_URL")
+            or "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf?download=true"
+        )
+        model_file.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[download] Fetching model to {model_file} ...")
+        with requests.get(url, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            size = int(r.headers.get("content-length", 0))
+            bytes_read = 0
+            with open(model_file, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        bytes_read += len(chunk)
+                        if size:
+                            pct = (bytes_read / size) * 100
+                            if int(pct) % 10 == 0:
+                                print(f"[download] {pct:.0f}%")
+        print("[download] Done.")
+        return str(model_file)
