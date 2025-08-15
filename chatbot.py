@@ -56,22 +56,27 @@ class Chatbot:
             raise RuntimeError("Tokenizer not loaded. Provide one or set autoload=True.")
         return self.tokenizer.decode(reply_ids, skip_special_tokens=True).strip()
 
-    def generate(self, prompt: str, max_new_tokens: int = 128) -> str:
+    def generate_reply(self, prompt: str) -> str:
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model/tokenizer not loaded. Provide them or set autoload=True.")
         if not _HAS_TORCH:
             raise RuntimeError("PyTorch is required to generate. Install with: pip install torch")
 
-        encoded = self.encode_prompt(prompt + self.tokenizer.eos_token)
+        prompt = prompt + "\n"
+        encoded = self.encode_prompt(prompt)
         input_ids = encoded["input_ids"].to(self.device)
         attention_mask = encoded["attention_mask"].to(self.device)
 
         output_ids = self.model.generate(
             input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
             pad_token_id=self.tokenizer.eos_token_id,
+            max_new_tokens=100,
+            do_sample=True,
+            temperature=0.9,
+            top_p=0.8,
+            top_k=50
         )
 
-        reply_ids = output_ids[0, input_ids.shape[-1]:]
-        return self.decode_reply(reply_ids)
+        decoded_text = self.decode_reply(output_ids[0])
+        return decoded_text[len(prompt):].strip()
