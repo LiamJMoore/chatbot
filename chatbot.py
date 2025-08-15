@@ -2,7 +2,7 @@ from typing import Optional
 import importlib
 import re
 
-# ==== Safety & resources ====
+# ===== Safety & resources =====
 
 UK_RESOURCES = (
     "• Emergency (UK): Call 999 now if you are in immediate danger.\n"
@@ -45,7 +45,6 @@ def crisis_reply() -> str:
         "If you’d like, I can stay with you here while you reach out. Would you like some grounding tips?"
     )
 
-# Helpline intent (UK signposting)
 _HELPLINE_PATTERNS = [
     r"\b(who.*call.*mental\s*health)\b",
     r"\b(mental\s*health (helpline|hotline|number))\b",
@@ -66,7 +65,7 @@ def helpline_reply() -> str:
         "If you’d like, I can also share some coping ideas while you reach out."
     )
 
-# ==== Lazy import torch so this module imports without it ====
+# ===== Lazy import torch so this module imports without it =====
 
 try:
     torch = importlib.import_module("torch")
@@ -127,9 +126,18 @@ class Chatbot:
 
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
+            # ---- IMPORTANT: avoid meta tensors on CPU; materialize real weights ----
             model_kwargs = {}
-            if _HAS_TORCH and getattr(self.device, "type", "cpu") == "cuda":
-                model_kwargs["torch_dtype"] = getattr(torch, "float16", None)
+            if _HAS_TORCH:
+                dev_type = getattr(self.device, "type", str(self.device))
+                if dev_type == "cuda":
+                    model_kwargs["torch_dtype"] = getattr(torch, "float16", None)
+                    model_kwargs["low_cpu_mem_usage"] = False
+                    model_kwargs["device_map"] = None
+                else:  # CPU (or MPS -> load on CPU then .to(mps) if needed)
+                    model_kwargs["torch_dtype"] = torch.float32
+                    model_kwargs["low_cpu_mem_usage"] = False
+                    model_kwargs["device_map"] = None
 
             self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
             if _HAS_TORCH:
@@ -183,7 +191,7 @@ class Chatbot:
     def generate_reply(
         self,
         user_text: str,
-        max_new_tokens: int = 180,
+        max_new_tokens: int = 80,   # lighter default for small plans
         temperature: float = 0.8,
         top_p: float = 0.9,
         top_k: int = 40,
@@ -207,20 +215,21 @@ class Chatbot:
         eos_id = self.end_token_id or self.tokenizer.eos_token_id
         pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
 
-        out = self.model.generate(
-            input_ids=enc["input_ids"],
-            attention_mask=enc["attention_mask"],
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id,
-        )
+        with torch.no_grad():
+            out = self.model.generate(
+                input_ids=enc["input_ids"],
+                attention_mask=enc["attention_mask"],
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                pad_token_id=pad_id,
+                eos_token_id=eos_id,
+            )
 
-        # Slice by token IDs (not characters) to avoid broken tokens like "t|>"
+        # Slice by token IDs (not characters)
         start = enc["input_ids"].shape[-1]
         gen_ids = out[0, start:]
         reply_text = self.decode_reply(gen_ids.tolist()).strip()
@@ -230,17 +239,18 @@ class Chatbot:
         return reply_text
 
     # Optional one-shot generator (non-chat)
-    def generate(self, prompt: str, max_new_tokens: int = 128) -> str:
+    def generate(self, prompt: str, max_new_tokens: int = 64) -> str:
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model/tokenizer not loaded.")
         if not _HAS_TORCH:
             raise RuntimeError("PyTorch is required to generate. Install with: pip install torch")
         enc = self.encode_prompt(prompt)
-        out = self.model.generate(
-            **enc,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-            eos_token_id=self.end_token_id or self.tokenizer.eos_token_id,
-        )
+        with torch.no_grad():
+            out = self.model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                eos_token_id=self.end_token_id or self.tokenizer.eos_token_id,
+            )
         ids = out[0, enc["input_ids"].shape[-1]:].tolist()
         return self.decode_reply(ids)

@@ -1,5 +1,5 @@
-import os
-from typing import Optional, Dict
+import os, threading
+from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from chatbot import Chatbot  # TinyLlama therapist-safe bot
+from chatbot import Chatbot
 
 app = FastAPI(title="Support Bot (not a crisis service)")
 app.add_middleware(
@@ -20,36 +20,49 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
 def root():
-    index_path = os.path.join("static", "index.html")
-    return FileResponse(index_path)
-
-# Simple per-session memory (in-memory). For production, use Redis.
-SESSIONS: Dict[str, Chatbot] = {}
+    return FileResponse(os.path.join("static", "index.html"))
 
 class ChatIn(BaseModel):
     message: str
-    session_id: Optional[str] = None  # sticky sessions by ID
+    session_id: Optional[str] = None
 
 class ChatOut(BaseModel):
     reply: str
     session_id: str
 
+# ---- One global model; per-session we store just the history text
+BOT: Optional[Chatbot] = None
+BOT_LOCK = threading.Lock()
+SESSIONS: Dict[str, Optional[str]] = {}  # session_id -> history_text
+
+@app.on_event("startup")
+def load_model_once():
+    global BOT
+    model_name = os.getenv("BOT_MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    print(f"[startup] Loading model: {model_name}")
+    BOT = Chatbot(model_name=model_name)
+    BOT.reset_history()
+    print("[startup] Model ready")
+
 @app.post("/api/chat", response_model=ChatOut)
 def chat(payload: ChatIn):
-    msg = (payload.message or "").strip()
-    if not msg:
+    if not payload.message or not payload.message.strip():
         raise HTTPException(400, "Empty message")
+    if BOT is None:
+        raise HTTPException(500, "Model not loaded")
 
     sid = payload.session_id or os.urandom(8).hex()
-    bot = SESSIONS.get(sid)
-    if bot is None:
-        bot = Chatbot(model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-        SESSIONS[sid] = bot
+    if sid not in SESSIONS:
+        SESSIONS[sid] = None
 
     try:
-        reply = bot.generate_reply(msg)
+        with BOT_LOCK:  # serialize generation on small CPU plans
+            BOT.history_text = SESSIONS[sid]          # restore this user's history
+            reply = BOT.generate_reply(payload.message)
+            SESSIONS[sid] = BOT.history_text          # save updated history
     except Exception as e:
-        raise HTTPException(500, f"Model error: {e}")
+        print("[/api/chat] error:", repr(e))
+        raise HTTPException(500, "Model error")
 
     return ChatOut(reply=reply, session_id=sid)
 
