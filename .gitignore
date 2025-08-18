@@ -1,2 +1,14 @@
 venv
 .env
+# Models & weights
+/models/
+/TinyLlama/
+/opt/models/
+/*.gguf
+*.gguf
+*.bin
+*.pt
+*.safetensors
+# Python cache
+__pycache__/
+*.pyc
